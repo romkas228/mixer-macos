@@ -1,0 +1,15 @@
+.build/
+build/
+.swiftpm/
+.mixer-signing/
+.DS_Store
+*.xcuserstate
+__pycache__/
+*.p12
+*.pfx
+/docs/RELEASE.md
+/docs/LICENSING.md
+/docs/NATIVE-UX.md
+/docs/PERFORMANCE.md
+/docs/PERFORMANCE-REVIEW.md
+/docs/performance/

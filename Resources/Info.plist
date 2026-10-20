@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>uk</string>
+    <key>CFBundleExecutable</key><string>Mixer</string>
+    <key>CFBundleIdentifier</key><string>local.mixer.Mixer</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>Mixer</string>
+    <key>CFBundleDisplayName</key><string>Mixer</string>
+    <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.18</string>
+    <key>CFBundleVersion</key><string>19</string>
+    <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Mixer потребує доступу до звуку програм, щоб змінювати їхню гучність і аудіовихід. Звук обробляється лише на цьому Mac, без запису та передавання.</string>
+    <key>NSHumanReadableCopyright</key><string>© 2026</string>
+</dict>
+</plist>
