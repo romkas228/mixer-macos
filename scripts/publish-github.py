@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "romkas228/mixer-macos"
 OWNER = "romkas228"
 REMOTE = "https://github.com/romkas228/mixer-macos.git"
+# These files do not change the app or its build. A resumed release keeps its
+# original tag while fixes to publication tooling can advance main.
+PUBLICATION_FILES = {"scripts/publish-github.py", "Tests/PublicationChecks.py", "docs/PUBLISHING.md"}
 
 
 def module(name, filename):
@@ -41,7 +44,9 @@ def command(*args, missing=False):
     if result.returncode:
         if missing and "HTTP 404" in result.stderr:
             return None
-        raise PublicationError((result.stderr or result.stdout).strip() or f"Не вдалося виконати {args[0]}")
+        operation = " ".join(str(a) for a in args[:3])
+        detail = (result.stderr or result.stdout).strip() or f"Код завершення {result.returncode}"
+        raise PublicationError(f"{operation}: {detail}")
     return result.stdout.strip()
 
 
@@ -59,6 +64,21 @@ def identity():
     require(user["login"].casefold() == OWNER, f"Потрібен вхід у GitHub CLI як {OWNER}.")
     require(isinstance(user["id"], int) and user["id"] > 0, "Не вдалося прочитати GitHub user ID.")
     return f"{user['id']}+{OWNER}@users.noreply.github.com"
+
+
+def find_release(tag):
+    # GET /releases/tags/{tag} only finds published releases. The authenticated
+    # listing includes drafts, identified by their pending tag_name.
+    matches = []
+    page = 1
+    while True:
+        releases = api(f"repos/{REPOSITORY}/releases?per_page=100&page={page}")
+        require(isinstance(releases, list), "GitHub повернув невірний перелік релізів.")
+        matches.extend(release for release in releases if release["tag_name"] == tag)
+        require(len(matches) <= 1, f"Знайдено декілька релізів для {tag}; автоматично вони не змінюються.")
+        if len(releases) < 100:
+            return matches[0] if matches else None
+        page += 1
 
 
 def release_assets(release, version):
@@ -121,9 +141,26 @@ def commit_source(source, manifest, email):
     return command("git", "rev-parse", "HEAD")
 
 
+def release_commit(version, head):
+    tag = "v" + version
+    if not command("git", "tag", "--list", tag):
+        command("git", "tag", "--annotate", tag, "--message", f"Mixer {version}", head)
+        return head
+    target = command("git", "rev-list", "-n", "1", tag)
+    if target != head:
+        ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", target, head],
+                                  cwd=ROOT, capture_output=True)
+        require(ancestor.returncode == 0, "Тег релізу не належить поточній історії main; він не змінений.")
+        changed = set(command("git", "diff", "--name-only", target, head, "--").splitlines())
+        require(changed <= PUBLICATION_FILES,
+                f"Код або файли збірки змінилися після {tag}. Потрібна нова версія; тег не змінений.")
+        print(f"Тег {tag} збережено на {target[:12]}; main містить виправлення інструментів публікації.", flush=True)
+    return target
+
+
 def upload_draft(ready, version, commit):
     tag = "v" + version
-    current = api(f"repos/{REPOSITORY}/releases/tags/{tag}", missing=True)
+    current = find_release(tag)
     if current is not None:
         require(current["draft"], "Реліз уже опублікований; автоматично він не змінюється.")
     assets = [ready / f"Mixer-{version}-macOS-arm64.zip", ready / "SHA256SUMS",
@@ -145,8 +182,8 @@ def upload_draft(ready, version, commit):
                 command("gh", "release", "upload", tag, path, "--repo", REPOSITORY)
         command("gh", "release", "edit", tag, "--repo", REPOSITORY, "--prerelease",
                 "--notes-file", ready / "RELEASE-NOTES.md", "--title", f"Mixer {version}")
-    result = api(f"repos/{REPOSITORY}/releases/tags/{tag}")
-    require(result["draft"] and result["prerelease"], "Не підтверджено стан draft pre-release.")
+    result = find_release(tag)
+    require(result is not None and result["draft"] and result["prerelease"], "Не підтверджено стан draft pre-release.")
     require({p.name for p in assets} <= {a["name"] for a in result["assets"]}, "У draft бракує assets.")
     return result["html_url"]
 
@@ -158,37 +195,39 @@ def main():
         require(shutil.which("gh") and shutil.which("git"), "Потрібні GitHub CLI (gh) та git.")
         manifest, snapshot, archive = source.prepare()
         print(f"Підготовлено {len(manifest['files'])} файлів: {archive}", flush=True)
+        print("Перевіряю акаунт і стан репозиторію GitHub…", flush=True)
         email = identity()
         remote = api(f"repos/{REPOSITORY}", missing=True)
         if remote is not None:
             require(remote["full_name"].casefold() == REPOSITORY and not remote["private"],
                     "Існуючий репозиторій має іншу адресу або видимість.")
-            existing_release = api(f"repos/{REPOSITORY}/releases/tags/v{manifest['version']}", missing=True)
+            existing_release = find_release("v" + manifest["version"])
             require(existing_release is None or existing_release["draft"],
                     "Реліз цієї версії вже опубліковано; репозиторій не змінений.")
             branches = api(f"repos/{REPOSITORY}/branches?per_page=100")
             require(not branches or {b["name"] for b in branches} == {"main"},
                     "Існуючий репозиторій містить інші гілки; він не змінений.")
+        print("Перевіряю підпис і файли готового пакета…", flush=True)
         ready = release_assets(release, manifest["version"])
-        commit = commit_source(source, manifest, email)
+        print("Зберігаю перевірені вихідні файли в Git…", flush=True)
+        head = commit_source(source, manifest, email)
         tag = "v" + manifest["version"]
-        tags = command("git", "tag", "--list", tag)
-        if tags:
-            require(command("git", "rev-list", "-n", "1", tag) == commit, "Локальний тег указує на інший commit.")
-        else:
-            command("git", "tag", "--annotate", tag, "--message", f"Mixer {manifest['version']}", commit)
+        commit = release_commit(manifest["version"], head)
         if remote is None:
+            print(f"Створюю публічний репозиторій {REPOSITORY}…", flush=True)
             command("gh", "repo", "create", REPOSITORY, "--public", "--disable-wiki",
                     "--description", "Native per-app audio mixer for macOS 26+ — Swift, AppKit and Core Audio")
         else:
             refs = git("ls-remote", "origin", "refs/heads/main")
             if refs:
                 remote_head = refs.split()[0]
-                known = subprocess.run(["git", "merge-base", "--is-ancestor", remote_head, commit], cwd=ROOT, capture_output=True)
+                known = subprocess.run(["git", "merge-base", "--is-ancestor", remote_head, head], cwd=ROOT, capture_output=True)
                 require(known.returncode == 0, "Історія віддаленої main відрізняється; force push не виконується.")
+        print(f"Передаю main і {tag} на GitHub…", flush=True)
         git("push", "--set-upstream", "origin", "main")
         command("gh", "repo", "edit", REPOSITORY, "--default-branch", "main")
         git("push", "origin", "refs/tags/" + tag)
+        print(f"Перевіряю або доповнюю draft pre-release {tag}…", flush=True)
         draft = upload_draft(ready, manifest["version"], commit)
         print(f"Код: https://github.com/{REPOSITORY}\nЧернетка релізу: {draft}")
         print("Реліз залишається draft; бінарний пакет ще не опубліковано.")

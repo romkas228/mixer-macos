@@ -1,11 +1,13 @@
 # Copyright (C) 2026 romkas228
 # SPDX-License-Identifier: GPL-3.0-only
-"""Source publication guards. No network, real commits, or remote writes."""
+"""Source publication guards. Git fixtures stay in temp dirs; no remote writes."""
 import contextlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -30,7 +32,7 @@ class PublicationChecks(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="mixer-publication-checks-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         for original in source.selected_files(PROJECT):
             destination = self.root / original.relative_to(PROJECT)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +109,8 @@ class PublicationChecks(unittest.TestCase):
         names = ["Mixer-0.1.18-macOS-arm64.zip", "SHA256SUMS", "INSTALL.md", "release-manifest.json"]
         result = {"draft": True, "prerelease": True, "assets": [{"name": n} for n in names],
                   "html_url": "https://github.com/romkas228/mixer-macos/releases/test"}
-        with patch.object(publication, "api", side_effect=[None, result]), patch.object(publication, "command") as command:
+        with patch.object(publication, "api", side_effect=[[], [dict(result, tag_name="v0.1.18")]]), \
+             patch.object(publication, "command") as command:
             publication.upload_draft(self.root, "0.1.18", "a" * 40)
             arguments = command.call_args.args
             self.assertEqual(arguments[:3], ("gh", "release", "create"))
@@ -117,7 +120,8 @@ class PublicationChecks(unittest.TestCase):
             self.assertNotIn("--clobber", arguments)
 
     def test_published_release_is_not_modified(self):
-        with patch.object(publication, "api", return_value={"draft": False}), patch.object(publication, "command") as command:
+        with patch.object(publication, "api", return_value=[{"draft": False, "tag_name": "v0.1.18"}]), \
+             patch.object(publication, "command") as command:
             with self.assertRaises(publication.PublicationError):
                 publication.upload_draft(self.root, "0.1.18", "a" * 40)
             command.assert_not_called()
@@ -126,7 +130,7 @@ class PublicationChecks(unittest.TestCase):
         responses = [
             {"login": "romkas228", "id": 7},
             {"full_name": "romkas228/mixer-macos", "private": False},
-            {"draft": False},
+            [{"draft": False, "tag_name": "v0.1.18"}],
         ]
         with patch.object(publication, "module", side_effect=self.fake_modules()), \
              patch.object(publication, "api", side_effect=responses), \
@@ -137,6 +141,159 @@ class PublicationChecks(unittest.TestCase):
             self.assertEqual(publication.main(), 1)
             command.assert_not_called()
             commit.assert_not_called()
+
+    def test_draft_is_found_even_when_published_tag_endpoint_returns_404(self):
+        draft = {"id": 8, "tag_name": "v0.1.18", "draft": True}
+
+        def server(arguments, **kwargs):
+            if arguments[2].endswith("/releases?per_page=100&page=1"):
+                return SimpleNamespace(returncode=0, stdout=json.dumps([draft]), stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)")
+
+        with patch.object(publication.subprocess, "run", side_effect=server):
+            self.assertEqual(publication.find_release("v0.1.18"), draft)
+            with self.assertRaisesRegex(publication.PublicationError, "gh api .*releases/tags/v0.1.18.*HTTP 404"):
+                publication.api(f"repos/{publication.REPOSITORY}/releases/tags/v0.1.18")
+
+    def test_draft_on_later_page_is_found_and_duplicate_tags_are_rejected(self):
+        first_page = [{"tag_name": f"other-{i}"} for i in range(100)]
+        draft = {"id": 8, "tag_name": "v0.1.18", "draft": True}
+        with patch.object(publication, "api", side_effect=[first_page, [draft]]) as api:
+            self.assertEqual(publication.find_release("v0.1.18"), draft)
+            self.assertTrue(api.call_args.args[0].endswith("page=2"))
+        with patch.object(publication, "api", side_effect=[[draft] + first_page[:99], [draft]]):
+            with self.assertRaisesRegex(publication.PublicationError, "декілька релізів"):
+                publication.find_release("v0.1.18")
+
+    def asset_fixture(self):
+        ready = self.root / "build/releases/v0.1.18-arm64"
+        ready.mkdir(parents=True)
+        names = ["Mixer-0.1.18-macOS-arm64.zip", "SHA256SUMS", "INSTALL.md", "release-manifest.json"]
+        for name in names:
+            (ready / name).write_bytes(("fixture " + name).encode())
+        result = {"id": 8, "tag_name": "v0.1.18", "draft": True, "prerelease": True,
+                  "assets": [{"name": name} for name in names], "html_url": "https://example.test/draft"}
+        return ready, names, result
+
+    def test_existing_draft_is_resumed_without_creating_another_or_replacing_assets(self):
+        ready, names, result = self.asset_fixture()
+        partial = dict(result, assets=result["assets"][:2])
+
+        def download(*arguments):
+            if arguments[:3] == ("gh", "release", "download"):
+                name = arguments[arguments.index("--pattern") + 1]
+                directory = Path(arguments[arguments.index("--dir") + 1])
+                (directory / name).write_bytes((ready / name).read_bytes())
+
+        with patch.object(publication, "ROOT", self.root), \
+             patch.object(publication, "api", side_effect=[[partial], [result]]), \
+             patch.object(publication, "command", side_effect=download) as command:
+            self.assertEqual(publication.upload_draft(ready, "0.1.18", "a" * 40), result["html_url"])
+        calls = [call.args for call in command.call_args_list]
+        self.assertFalse(any(args[:3] == ("gh", "release", "create") for args in calls))
+        self.assertEqual([args[4].name for args in calls if args[:3] == ("gh", "release", "upload")], names[2:])
+        self.assertFalse(any("--clobber" in args or "--draft=false" in args for args in calls))
+
+    def test_different_existing_asset_is_rejected(self):
+        ready, _, result = self.asset_fixture()
+
+        def download(*arguments):
+            name = arguments[arguments.index("--pattern") + 1]
+            directory = Path(arguments[arguments.index("--dir") + 1])
+            (directory / name).write_bytes(b"different remote asset")
+
+        with patch.object(publication, "ROOT", self.root), \
+             patch.object(publication, "api", return_value=[result]), \
+             patch.object(publication, "command", side_effect=download) as command:
+            with self.assertRaisesRegex(publication.PublicationError, "не перезаписаний"):
+                publication.upload_draft(ready, "0.1.18", "a" * 40)
+            self.assertEqual(command.call_count, 1)
+            self.assertEqual(command.call_args.args[:3], ("gh", "release", "download"))
+
+    def fixture_git(self, *arguments):
+        result = subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                                 "-c", "commit.gpgsign=false", *arguments], cwd=self.root,
+                                capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    def tagged_fixture(self):
+        self.fixture_git("init", "--initial-branch=main")
+        self.fixture_git("add", ".")
+        self.fixture_git("commit", "-m", "Fixture release")
+        original = self.fixture_git("rev-parse", "HEAD")
+        self.fixture_git("tag", "v0.1.18", original)
+        return original
+
+    def test_retry_preserves_existing_tag_after_publication_tool_fix(self):
+        original = self.tagged_fixture()
+        script = self.root / "scripts/publish-github.py"
+        script.write_text(script.read_text() + "\n# fixture publication fix\n")
+        self.fixture_git("add", "scripts/publish-github.py")
+        self.fixture_git("commit", "-m", "Fix publication fixture")
+        head = self.fixture_git("rev-parse", "HEAD")
+        with patch.object(publication, "ROOT", self.root), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(publication.release_commit("0.1.18", head), original)
+        self.assertNotEqual(original, head)
+        self.assertEqual(self.fixture_git("rev-parse", "v0.1.18"), original)
+
+    def test_full_retry_commits_tool_fix_and_resumes_original_draft(self):
+        original = self.tagged_fixture()
+        script = self.root / "scripts/publish-github.py"
+        script.write_text(script.read_text() + "\n# fixture publication fix\n")
+        ready, _, result = self.asset_fixture()
+        run_command = publication.command
+
+        def remote_api(path, **kwargs):
+            if path == "user":
+                return {"login": "romkas228", "id": 7}
+            if path == f"repos/{publication.REPOSITORY}":
+                return {"full_name": publication.REPOSITORY, "private": False}
+            if "/releases?" in path:
+                return [result]
+            if "/branches?" in path:
+                return [{"name": "main"}]
+            raise AssertionError("Unexpected API endpoint: " + path)
+
+        def execute(*arguments, **kwargs):
+            if arguments[:3] == ("gh", "release", "download"):
+                name = arguments[arguments.index("--pattern") + 1]
+                directory = Path(arguments[arguments.index("--dir") + 1])
+                (directory / name).write_bytes((ready / name).read_bytes())
+                return ""
+            if arguments[:3] in (("gh", "release", "edit"), ("gh", "repo", "edit")):
+                return ""
+            self.assertEqual(arguments[0], "git")
+            return run_command(*arguments, **kwargs)
+
+        with patch.object(publication, "ROOT", self.root), \
+             patch.object(publication, "api", side_effect=remote_api), \
+             patch.object(publication, "release_assets", return_value=ready), \
+             patch.object(publication, "git", return_value=original + "\trefs/heads/main") as remote_git, \
+             patch.object(publication, "command", side_effect=execute), \
+             patch.object(publication, "upload_draft", wraps=publication.upload_draft) as upload, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(publication.main(), 0, errors.getvalue())
+        self.assertNotEqual(self.fixture_git("rev-parse", "HEAD"), original)
+        self.assertEqual(self.fixture_git("rev-parse", "v0.1.18"), original)
+        self.assertEqual(self.fixture_git("status", "--porcelain"), "")
+        self.assertEqual(upload.call_args.args[-1], original)
+        self.assertEqual([call.args for call in remote_git.call_args_list], [
+            ("ls-remote", "origin", "refs/heads/main"),
+            ("push", "--set-upstream", "origin", "main"),
+            ("push", "origin", "refs/tags/v0.1.18"),
+        ])
+
+    def test_app_changes_cannot_reuse_existing_version_tag(self):
+        original = self.tagged_fixture()
+        app = self.root / "Sources/Mixer/MixerApplication.swift"
+        app.write_text(app.read_text() + "\n// fixture app change\n")
+        self.fixture_git("add", "Sources/Mixer/MixerApplication.swift")
+        self.fixture_git("commit", "-m", "Change app fixture")
+        head = self.fixture_git("rev-parse", "HEAD")
+        with patch.object(publication, "ROOT", self.root):
+            with self.assertRaisesRegex(publication.PublicationError, "Потрібна нова версія"):
+                publication.release_commit("0.1.18", head)
+        self.assertEqual(self.fixture_git("rev-parse", "v0.1.18"), original)
 
 
 if __name__ == "__main__":
